@@ -82,6 +82,11 @@ LOCAL_STUDIO_API_KEY=$API_KEY
 LOCAL_STUDIO_DEFAULT_BACKEND=$BACKEND
 ENVEOF
 
+echo "→ Install unzip (required by bun installer)..."
+if ! command -v unzip >/dev/null 2>&1; then
+  apt-get update -qq 2>/dev/null && apt-get install -y -qq unzip 2>&1 | tail -2 || true
+fi
+
 echo "→ Check bun..."
 if ! command -v bun >/dev/null 2>&1; then
   echo "  bun not found — installing..."
