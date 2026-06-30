@@ -3,18 +3,8 @@
 #
 # Usage: fleet-deploy.sh <machineId> [--api-key <key>]
 #
-# Steps:
-#   1. SSH to the target machine (via Tailscale hostname from fleet-overnight API)
-#   2. Clone/update the lionrooter/local-studio fork (pinned branch)
-#   3. Generate .env from fleet-recipes.json match
-#   4. Install dependencies (bun install)
-#   5. Create LaunchAgent (macOS) or systemd service (Linux) for the controller
-#
-# Prerequisites:
-#   - SSH access to the target machine (Tailscale)
-#   - bun installed on the target machine
-#   - For vLLM backend: NVIDIA GPU + CUDA toolkit
-#   - For MLX backend: Apple Silicon Mac
+# Uses `ssh ... bash -s` heredoc pattern so ALL variables expand on the remote
+# side (avoids $HOME / escaping bugs). Passes params as positional args.
 set -euo pipefail
 
 MACHINE_ID="${1:?Usage: fleet-deploy.sh <machineId> [--api-key <key>]}"
@@ -25,7 +15,6 @@ fi
 
 REPO_URL="https://github.com/lionrooter/local-studio.git"
 BRANCH="lionroot-pinned-v1.51.5"
-CLONE_DIR="$HOME/local-studio"
 LAUNCH_AGENT_LABEL="ai.lionroot.local-studio-controller"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RECIPES="$SCRIPT_DIR/fleet-recipes.json"
@@ -65,65 +54,106 @@ HOST=$(resolve_host "$MACHINE_ID") || {
   exit 1
 }
 BACKEND=$(resolve_backend "$MACHINE_ID")
+API_KEY_VAL="${API_KEY:-$(openssl rand -hex 24 2>/dev/null || echo "changeme")}"
+
 echo "Deploying local-studio to $MACHINE_ID ($HOST) with backend: $BACKEND"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
-# Step 1: Clone/update the fork on the target
-echo "→ Cloning/updating fork on $HOST..."
-ssh -n "${SSH_OPTS[@]}" "$HOST" "
-  if [ -d $CLONE_DIR/.git ]; then
-    cd $CLONE_DIR && git fetch origin && git checkout $BRANCH && git reset --hard origin/$BRANCH
-  else
-    git clone --branch $BRANCH --depth 1 $REPO_URL $CLONE_DIR
-  fi
-" 2>&1
+# Run entire remote setup via bash -s heredoc — all vars expand on the remote.
+# Args: $1=REPO_URL $2=BRANCH $3=API_KEY $4=BACKEND $5=LABEL
+ssh "${SSH_OPTS[@]}" "$HOST" bash -s "$REPO_URL" "$BRANCH" "$API_KEY_VAL" "$BACKEND" "$LAUNCH_AGENT_LABEL" <<'REMOTE'
+set -euo pipefail
+REPO_URL="$1"; BRANCH="$2"; API_KEY="$3"; BACKEND="$4"; LABEL="$5"
+CLONE_DIR="$HOME/local-studio"
 
-# Step 2: Generate .env
-echo "→ Generating .env..."
-API_KEY_VAL="${API_KEY:-$(openssl rand -hex 24 2>/dev/null || echo 'changeme')}"
-ssh -n "${SSH_OPTS[@]}" "$HOST" "cat > $CLONE_DIR/.env <<ENVEOF
+echo "→ Clone/update fork..."
+if [ -d "$CLONE_DIR/.git" ]; then
+  cd "$CLONE_DIR" && git fetch origin && git checkout "$BRANCH" && git reset --hard "origin/$BRANCH"
+else
+  git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$CLONE_DIR"
+fi
+
+echo "→ Generate .env..."
+cat > "$CLONE_DIR/.env" <<ENVEOF
 LOCAL_STUDIO_HOST=0.0.0.0
 LOCAL_STUDIO_PORT=8080
-LOCAL_STUDIO_API_KEY=$API_KEY_VAL
+LOCAL_STUDIO_API_KEY=$API_KEY
 LOCAL_STUDIO_DEFAULT_BACKEND=$BACKEND
 ENVEOF
-" 2>&1
-echo "  API key: ${API_KEY_VAL:0:8}... (saved in .env on $HOST)"
 
-# Step 3: Install dependencies
-echo "→ Installing dependencies..."
-ssh -n "${SSH_OPTS[@]}" "$HOST" "cd $CLONE_DIR && bun install" 2>&1 | tail -5
+echo "→ Check bun..."
+if ! command -v bun >/dev/null 2>&1; then
+  echo "  bun not found — installing..."
+  curl -fsSL https://bun.sh/install | bash
+  export PATH="$HOME/.bun/bin:$PATH"
+fi
 
-# Step 4: Create LaunchAgent (macOS) or systemd service (Linux)
-echo "→ Creating system service..."
-ssh -n "${SSH_OPTS[@]}" "$HOST" "
-  if [ \"\$(uname)\" = \"Darwin\" ]; then
-    mkdir -p ~/Library/LaunchAgents
-    cat > ~/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist <<PLISTEOF
-<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
+echo "→ Install dependencies..."
+cd "$CLONE_DIR" && bun install
+
+echo "→ Create system service..."
+if [ "$(uname)" = "Darwin" ]; then
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$HOME/Library/LaunchAgents/${LABEL}.plist" <<'PLISTEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
-  <key>Label</key><string>${LAUNCH_AGENT_LABEL}</string>
+  <key>Label</key><string>PLACEHOLDER_LABEL</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string><string>-lc</string>
-    <string>cd $CLONE_DIR && exec bun run controller</string>
+    <string>cd PLACEHOLDER_CLONE && exec bun run controller</string>
   </array>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$CLONE_DIR/controller.log</string>
-  <key>StandardErrorPath</key><string>$CLONE_DIR/controller.err.log</string>
+  <key>StandardOutPath</key><string>PLACEHOLDER_CLONE/controller.log</string>
+  <key>StandardErrorPath</key><string>PLACEHOLDER_CLONE/controller.err.log</string>
 </dict>
 </plist>
 PLISTEOF
-    launchctl bootstrap gui/\\\$(id -u) ~/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist 2>/dev/null || true
-    echo 'LaunchAgent created + loaded'
-  else
-    echo 'Linux systemd service creation not yet implemented — start manually: cd $CLONE_DIR && bun run controller'
-  fi
-" 2>&1
+  # Replace placeholders (can't use $ in the quoted heredoc above)
+  sed -i.bak "s|PLACEHOLDER_LABEL|$LABEL|g; s|PLACEHOLDER_CLONE|$CLONE_DIR|g" "$HOME/Library/LaunchAgents/${LABEL}.plist"
+  rm -f "$HOME/Library/LaunchAgents/${LABEL}.plist.bak"
+  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/${LABEL}.plist" 2>/dev/null || true
+  echo "  LaunchAgent created + loaded"
+else
+  # Linux: systemd user service
+  mkdir -p "$HOME/.config/systemd/user"
+  cat > "$HOME/.config/systemd/user/${LABEL}.service" <<'SVCEOF'
+[Unit]
+Description=Local Studio Controller
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=PLACEHOLDER_CLONE
+ExecStart=%h/.bun/bin/bun run controller
+Restart=always
+RestartSec=5
+Environment=LOCAL_STUDIO_HOST=0.0.0.0
+Environment=LOCAL_STUDIO_PORT=8080
+
+[Install]
+WantedBy=default.target
+SVCEOF
+  sed -i "s|PLACEHOLDER_CLONE|$CLONE_DIR|g" "$HOME/.config/systemd/user/${LABEL}.service"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "${LABEL}.service" 2>/dev/null || echo "  systemd service created (start manually if needed)"
+  echo "  systemd service created + started"
+fi
+
+echo "→ Verify controller is responding..."
+sleep 3
+if curl -sf -m 5 http://127.0.0.1:8080/api/system >/dev/null 2>&1; then
+  echo "  Controller is UP on :8080"
+else
+  echo "  Controller not yet responding (may still be starting — check $CLONE_DIR/controller.err.log)"
+fi
+
+echo "✓ Deploy complete on $(hostname)"
+REMOTE
 
 echo ""
 echo "✓ Deployed local-studio to $MACHINE_ID ($HOST)"
