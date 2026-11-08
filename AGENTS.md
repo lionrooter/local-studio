@@ -227,3 +227,12 @@ path) is the exception, only for risky feature-branch testing.
 - Engine installs (vLLM/SGLang/MLX) live in `<data dir>/runtime/venvs/<backend>-latest`,
   using `uv` when present, pip otherwise. Model weights live in
   `LOCAL_STUDIO_MODELS_DIR` (default `/models`).
+
+
+<!-- lionroot:unattended-workers:start -->
+## Execution scope
+
+Use task-relevant context and finish authorized work with proportionate verification. Resolve routine choices without another approval round; existing gates still apply.
+
+For unattended runs, read `~/.hermes/docs/unattended-workers.md` on the execution host. Preserve this project's authorization and workflow gates.
+<!-- lionroot:unattended-workers:end -->
